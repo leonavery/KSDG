@@ -1,0 +1,162 @@
+import numpy as np
+import fenics as fe
+from fenics import (SubDomain)
+from .ksdgdebug import log
+from .ksdgexception import KSDGException
+def logPERIODIC(*args, **kwargs):
+    log(*args, system='PERIODIC', **kwargs)
+
+
+class PeriodicDomain1D(SubDomain):
+
+    def __init__(self, dim=None, left=0.0, right=1.0, tol=fe.DOLFIN_EPS):
+        """dim argument allowed for convenience, but ignored"""
+        super().__init__()
+        self.tol = tol
+        self.left = left
+        self.right = right
+        self.width = right - left
+
+    def inside(self, x, on_boundary):
+        """True for left boundary only"""
+        return bool(on_boundary and fe.near(x[0], self.left, self.tol))
+
+    def map(self, x, y):
+        y[0] = x[0]
+        if fe.near(x[0], self.right, self.tol):
+            y[0] = self.left
+        logPERIODIC('x, y', x, y)
+        if any(np.isnan(y)):
+            logPERIODIC('map returns nan: x, y', x, y)
+            raise KSDGException('PeriodicDomain1D.map returns nan')
+        return
+
+class PeriodicDomain2D(SubDomain):
+    def __init__(self, dim=None, left=0.0, right=1.0, bottom=0.0,
+                 top=1.0, tol=fe.DOLFIN_EPS):
+        """dim argument allowed for convenience, but ignored"""
+        super().__init__()
+        self.tol = tol
+        self.left = left
+        self.right = right
+        self.width = right - left
+        self.bottom = bottom
+        self.top = top
+        self.height = top-bottom
+
+    def inside(self, x, on_boundary):
+        return bool(
+            on_boundary and
+            (fe.near(x[0], self.left, eps=self.tol) or
+             fe.near(x[1], self.bottom, eps=self.tol)) and
+            (not (fe.near(x[1], self.top, eps=self.tol) or
+                  fe.near(x[0], self.right, eps=self.tol)))
+        )
+
+    def map(self, x, y):
+        # y[0] = x[0]
+        # y[1] = x[1]
+        if (fe.near(x[0], self.right, eps=self.tol) and
+            fe.near(x[1], self.top, eps=self.tol)):
+            y[0] = self.left
+            y[1] = self.bottom
+        elif fe.near(x[0], self.right):
+            y[0] = self.left
+            y[1] = x[1]
+        elif fe.near(x[1], self.top):
+            y[0] = x[0]
+            y[1] = self.bottom
+        else:                             # just map to somewhere off boundary
+            y[0] = self.left - self.width
+            y[1] = self.bottom - self.height
+        logPERIODIC('x, y', x, y)
+        if any(np.isnan(y)):
+            logPERIODIC('map returns nan: x, y', x, y)
+            raise KSDGException('PeriodicDomain2D.map returns nan')
+        return
+
+class PeriodicDomain3D(SubDomain):
+
+    def __init__(self, dim=None, left=0.0, right = 1.0, bottom=0.0,
+                 top=1.0, below=0.0, above=1.0, tol=fe.DOLFIN_EPS): 
+        """dim argument allowed for convenience, but ignored"""
+        super().__init__()
+        self.tol = tol
+        self.left = left
+        self.right = right
+        self.width = right - left
+        self.bottom = bottom
+        self.top = top
+        self.height = top - bottom
+        self.below = below
+        self.above = above
+        self.depth = above - below
+
+    def inside(self, x, on_boundary):
+        return bool(
+            on_boundary and
+            (fe.near(x[0], self.leftx[0], eps=self.tol) or
+             fe.near(x[1], self.bottom, eps=self.tol) or
+                 fe.near(x[2], self.below, eps=self.tol)) and
+            (not (fe.near(x[0], self.right, eps=self.tol) or
+                  fe.near(x[1], self.top, eps=self.tol) or
+                  fe.near(x[2], self.above, eps=self.tol)))
+        )
+
+    def map(self, x, y):
+        y[0] = x[0]
+        y[1] = x[1]
+        y[2] = x[2]
+        if (fe.near(x[0], self.right, eps=self.tol) or
+            fe.near(x[1], self.top, eps=self.tol) or
+            fe.near(x[2], self.above, eps=self.tol)):
+            y[0] = (self.left if fe.near(x[0], self.right, eps=self.tol)
+                    else x[0])
+            y[1] = (self.bottom if fe.near(x[1], self.top, eps=self.tol)
+                    else x[1])
+            y[2] = (self.below if fe.near(x[2], self.above, eps=self.tol)
+                    else x[2])
+        else:
+            y[0] = self.left - self.width
+            y[1] = self.bottom - self.height
+            y[2] = self.below - self.depth
+        logPERIODIC('x, y', x, y)
+        if any(np.isnan(y)):
+            logPERIODIC('map returns nan: x, y', x, y)
+            raise KSDGException('PeriodicDomain3D.map returns nan')
+        return
+    
+pbclasses = (
+    PeriodicDomain1D,
+    PeriodicDomain2D,
+    PeriodicDomain3D
+)
+
+def pbdomain(
+    periodic=False,
+    dim=1,
+    width=1.0
+    ):
+    """pbdomain -- constrained_domain for periodic boundary conitions
+    Arguments:
+    periodic=False: whether to use periodic boundary
+        conditions. Returns None if periodic is False
+    dim=1: Number of dimensions
+    width=1.0: linear dimension of domain
+    """
+    if periodic:
+        if dim == 1:
+            domain = PeriodicDomain1D(dim=dim, left=0.0, right=width)
+        elif dim == 2:
+            domain = PeriodicDomain2D(dim=dim, 
+                                      left=0.0, right=width,
+                                      bottom=0.0, top=width)
+        elif dim == 3:
+            domain = PeriodicDomain3D(dim=dim, 
+                                      left=0.0, right=width,
+                                      bottom=0.0, top = width,
+                                      below = 0.0, above = width)
+    else:
+        domain = None
+    return(domain)
+

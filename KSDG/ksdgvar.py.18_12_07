@@ -1,0 +1,505 @@
+"""Functions for discontinuous Galerkin solution of the Keller-Segel PDEs.
+
+This module defines KSDGSolverVariable, an extension of
+KSDGSolverMultiple that allows for time-varying parameters. Most of
+the real model parameters are allowed to vary. The parameters argument
+to the constructor now supplies just the initial values of the
+parameters. Any parameter in this mappable whose value is of type
+float will be treated as a model variable that can vary with
+time. Most of these parameters have to do with the computation of the
+potential V, a function that the caller also supplies. Therefore, it
+is mostly up to the caller to determine what the parameters are. There
+are a few parameters that KSDGSolverVariable itself uses directly:
+sigma, rhomin, Umin, width, rhopen, Upen, grhopen, and gUpen. If not
+supplied by the caller, KSDGSolverVariable has defaults for these
+parameters. Although KSDGSolverVariable will treat all of them as
+time-varying, this probably makes sense only for sigma. (Note also
+that a time-varying width will not actually result in a time-varying
+domain size. The domain geometry is fixed at initialization.) 
+
+To accomodate the time variation, the constructor takes a
+new argument, dparamsdt. (It is the presence of this argument that
+signals to makeKSDGSolver that it is to create a KSDGSolverVariable
+object.)
+
+    dparamdts={}:
+    This is a mappable that contains functions to compute the time
+    derivatives of parameters. Each such function is called with two
+    arguments, the current value of the parameter and a mappable whose
+    keys are the names of the other parameters. For instance, it could
+    be
+    dparamsdt={
+        'sigma': lambda sigma, params={}: -dsigma * sigma,
+        'beta,2': lambda beta, params={}: -dbeta * beta
+    }
+    The first argument to the function is the current value of the
+    parameter, e.g. sigma or beta for group 2. It will also be passed
+    a mappable giving the values of the other parameters. The time
+    will also be passed as params['t']. As in the example, you may
+    ignore the params argument if you don't need it (However, your
+    function definition must accept this argument.)
+
+    The values of the parameter and the values in the mappable params
+    will not always be floats ,even though they represent real
+    numbers. In fact, they will generally be Indexed UFL objects that
+    reference the parameter subspace.
+
+    The KSDGSolverVariable class supplies a default function for
+    any parameters whose time derivatives are not specified in dtparamsdt
+    that will always return 0.0. To force all parameters to be fixed
+    in time, pass dparamsdt={}.
+
+The function V passed as an argument to the constructor must also
+accept a keyword argument params whose value is a mappable specifying
+the parameter values (generally UFL objects). Typically you will not
+be able to get away with ignoring this argument, since some of these
+parameters affect the computation of the potential.
+
+Functions and FunctionsSpaces:
+As always, the solution is held in a fenics Function ksdg.sol (where
+ksdg is the KSDGSolverVariable object). The FunctionSpace is
+ksdg.PVS. This FunctionSpace is a product of two FunctionSpaces, one,
+VS, for the spatial fields that the PDE concerns, and the second, PS,
+for the parameters. PS an R^n vector space, where n is the numebr of
+time-varying parameters. All these FunctionSpaces are constructed by
+the member function ksdg.make_function_spaces, which returns a
+dict. The product FunctionSpace is ungainly. the best way to access
+the subspace functions is by assignment to Functions defined on the
+subspaces, e.g.
+
+    fss = ksdg.make_function_spaces()
+    VS = fss['VS']
+    PS = fss['PS']
+    PVS = fss['PVS]
+    VSf = fe.Function(VS)
+    PSf = fe.Function(PS)
+    fe.assign(VSf, ksdg.sol.sub(0))
+    fe.assign(PSf, ksdg.sol.sub(1))
+"""
+
+import sys
+import numpy as np
+import itertools
+import collections
+import copy
+from datetime import datetime
+from petsc4py import PETSc
+from mpi4py import MPI
+import ufl
+# As a general rule, I import only fenics classes by name.
+import fenics as fe
+from fenics import (UnitIntervalMesh, UnitSquareMesh, UnitCubeMesh,
+                    IntervalMesh, RectangleMesh, BoxMesh, Point,
+                    FiniteElement, MixedElement, VectorElement,
+                    TrialFunctions, TestFunctions, Mesh, File,
+                    Expression, FunctionSpace, VectorFunctionSpace,
+                    TrialFunction, TestFunction, Function, Constant,
+                    Measure, FacetNormal, CellDiameter, PETScVector,
+                    PETScMatrix, SubDomain, MeshFunction,
+                    SubMesh, DirichletBC)
+import ufl
+
+from .ksdgsolver import (KSDGSolver, meshMakers, boxMeshMakers,
+                         cellShapes, unit_mesh, box_mesh, shapes)
+from .ksdgmultiple import KSDGSolverMultiple
+from .ksdgdebug import log
+from .ksdgexception import KSDGException
+from .ksdggather import gather_dof_coords, function_interpolate
+from .ksdgligand import ParameterList
+
+def logVARIABLE(*args, **kwargs):
+    log(*args, system='VARIABLE', **kwargs)
+
+
+class KSDGSolverVariable(KSDGSolverMultiple):
+    default_params = collections.OrderedDict(
+        sigma = 1.0,
+        rhomin = 1e-7,
+        Umin = 1e-7,
+        width = 1.0,
+        rhopen = 10.0,
+        Upen = 1.0,
+        grhopen = 1.0,
+        gUpen = 1.0,
+    )
+
+    def __init__(
+            self,
+            mesh=None,
+            width=1.0,
+            dim=1,
+            nelements=8,
+            degree=2,
+            parameters={},
+            dparamsdt={},
+            V=(lambda U: U),
+            U0=[],
+            rho0=None,
+            t0=0.0,
+            debug=False,
+            solver_type = 'gmres',
+            preconditioner_type = 'default',
+            periodic=False,
+            ligands=None
+            ):
+        """Discontinuous Galerkin solver for the Keller-Segel PDE system
+
+        Keyword parameters:
+        mesh=None: the mesh on which to solve the problem
+        width=1.0: the width of the domain
+        dim=1: # of spatial dimensions.
+        nelements=8: If mesh is not supplied, one will be
+        contructed using UnitIntervalMesh, UnitSquareMesh, or
+        UnitCubeMesh (depending on dim). dim and nelements are not
+        needed if mesh is supplied.
+        degree=2: degree of the polynomial approximation
+        parameters={}: a dict giving the values of scalar parameters of
+            .V, U0, and rho0 Expressions. This dict needs to also
+            define numerical parameters that appear in the PDE. Some
+            of these have defaults:
+            dim = dim: # of spatial dimensions
+            sigma: organism movement rate
+            rhomin=10.0**-7: minimum feasible worm density
+            Umin=10.0**-7: minimum feasible attractant concentration
+            rhopen=10: penalty for discontinuities in rho
+            Upen=1: penalty for discontinuities in U
+            grhopen=1, gUpen=1: penalties for discontinuities in gradients
+            nligands=1, number of ligands
+        V=(lambda Us: Us): a callable taking two arguments, Us and
+            rho, or a single argument, Us. Us is a list of length
+            nligands. rho is a single expression. V returns a single
+            number, V, the potential corresponding to Us (and
+            rho). Use ufl versions of mathematical functions,
+            e.g. ufl.ln, abs, ufl.exp.
+        rho0: Expressions, Functions, or strs specifying the
+            initial condition for rho.
+        U0: a list of nligands Expressions, Functions or strs
+            specifying the initial conditions for the ligands.
+        t0=0.0: initial time
+        solver_type='gmres'
+        preconditioner_type='default'
+        ligands=LigandGroups(): ligand list
+        periodic=False: ignored for compatibility
+        """
+        logVARIABLE('creating KSDGSolverVariable')
+        if not ligands:
+            ligands = LigandGroups()
+        else:
+            ligands = copy.deepcopy(ligands)
+        self.args = dict(
+            mesh=mesh,
+            width=width,
+            dim=dim,
+            nelements=nelements,
+            degree=degree,
+            parameters=parameters,
+            dparamsdt=dparamsdt,
+            V=V,
+            U0=U0,
+            rho0=rho0,
+            t0=t0,
+            debug=debug,
+            solver_type = solver_type,
+            preconditioner_type = preconditioner_type,
+            periodic=periodic,
+            ligands=ligands
+        )
+        self.debug = debug
+        self.solver_type = solver_type
+        self.preconditioner_type = preconditioner_type
+        self.periodic = False
+        self.ligands = ligands
+        self.nligands = ligands.nligands()
+        self.init_params(parameters, dparamsdt)
+        if (mesh):
+            self.omesh = self.mesh = mesh
+        else:
+            self.omesh = self.mesh = box_mesh(width=width, dim=dim,
+                                              nelements=nelements)
+            self.nelements = nelements
+        logVARIABLE('self.mesh', self.mesh)
+        logVARIABLE('self.mesh.mpi_comm().size', self.mesh.mpi_comm().size)
+        self.nelements = nelements
+        self.degree = degree
+        self.dim = self.mesh.geometry().dim()
+        # 
+        # Solution spaces and Functions
+        # 
+        fss = self.make_function_space()
+        (self.SE, self.SS, self.VE, self.VS, self.PS, self.PVS) = [
+            fss[fs] for fs in ('SE', 'SS', 'VE', 'VS', 'PS', 'PVS')
+        ]
+        logVARIABLE('self.VS', self.VS)
+        self.VSf = Function(self.VS)
+        self.PSf = Function(self.PS)
+        self.sol = Function(self.PVS)              # sol, current soln
+        logVARIABLE('self.sol', self.sol)
+        self.solVS, self.solPS = self.sol.split()
+        self.srho, self.sUs = self.solVS.sub(0), self.solVS.split()[1:]
+        splitsolVS, splitsolPS = fe.split(self.sol)
+        splitsolVS = list(splitsolVS)
+        self.irho, self.iUs = splitsolVS[0], splitsolVS[1:]
+        self.iPs = list(splitsolPS)
+        self.iparams = collections.OrderedDict(
+            zip(self.param_names, self.iPs)
+        )
+        self.iligands = copy.deepcopy(self.ligands)
+        self.iligand_params = ParameterList([
+            p for p in self.iligands.params()
+            if p[0] in self.param_numbers
+        ])
+        for k in self.iligand_params.keys():
+            i = self.param_numbers[k]
+            self.iligand_params[k] = self.iPs[i]
+        tfsVS, tfsPS = [ list(tfs) for tfs in TestFunctions(self.PVS) ]
+        self.wrho, self.wUs, self.wPs = tfsVS[0], tfsVS[1:], tfsPS
+        tfsVS, tfsPS = [ list(tfs) for tfs in TrialFunctions(self.PVS) ]
+        self.tdrho, self.tdUs, self.tdPs = tfsVS[0], tfsVS[1:], tfsPS
+        self.n = FacetNormal(self.mesh)
+        self.h = CellDiameter(self.mesh)
+        self.havg = fe.avg(self.h)
+        self.dx = fe.dx
+#        self.dx = fe.dx(metadata={'quadrature_degree': min(degree, 10)})
+        self.dS = fe.dS
+#        self.dS = fe.dS(metadata={'quadrature_degree': min(degree, 10)})
+        #
+        # record initial state
+        #
+        try:
+            V(self.iUs, self.irho, params=self.iparams)
+            def realV(Us, rho):
+                return V(Us, rho, params=self.iparams)
+        except TypeError:
+            def realV(Us, rho):
+                return V(Us, self.iparams)
+        self.V = realV
+        if not U0:
+            U0 = [Constant(0.0)] * self.nligands
+        self.U0s = [Constant(0.0)] * self.nligands
+        for i,U0i in enumerate(U0):
+            if isinstance(U0i, ufl.coefficient.Coefficient):
+                self.U0s[i] = U0i
+            else:
+                self.U0s[i] = Expression(U0i, **self.params,
+                                         degree=self.degree,
+                                         domain=self.mesh)
+        if not rho0:
+            rho0 = Constant(0.0)
+        if isinstance(rho0, ufl.coefficient.Coefficient):
+            self.rho0 = rho0
+        else:
+            self.rho0 = Expression(rho0, **self.params,
+                                   degree=self.degree, domain=self.mesh)
+        self.t0 = t0
+        #
+        # initialize state
+        #
+        self.restart()
+        return None
+
+    def init_params(self, parameters, dparamsdt):
+        """Initialize parameter attributes from __init__ arguments
+
+        The attributes initialized are:
+        self.params0: a dict giving initial values of all parameters
+        (not just floats). This is basically a copy of the parameters
+        argument to __init__, with the insertion of 't' as a new
+        parameter (always param_names[0]).
+        self.param_names: a list of the names of the time-varying
+        parameters. This is the keys of params0 whose corrsponding
+        values are of type float. The order is the order of the
+        parameters in the solution FunctionSpace.
+        self.nparams: len(self.param_names)
+        self.param_numbers: a dict mapping param names to numbers
+        (ints) in the list param_names and the parameters subspace of
+        the solution FunctionSpace.
+        self.dparamsdt: a dict whose keys are the param_names and
+        whose values are functions to determine their time
+        derivatives. These are copied from the dparamsdt argument of
+        __init__, except that the default 0.0 function is fileld in
+        for parameters not present in the argument. Also, the
+        derivative of 't' is always 1.0, making the system of DEs
+        autonomous.
+        """
+        self.param_names = [
+            n for n,v in parameters.items() if
+            (type(v) is float and n != 't')
+        ]
+        self.param_names.append('t')
+        self.nparams = len(self.param_names)
+        self.param_numbers = dict(
+            zip(self.param_names, itertools.count())
+        )
+        self.params0 = collections.OrderedDict(parameters)
+        self.params0['t'] = 0.0           # will later be set to t0
+        self.dparamsdt = dparamsdt.copy()
+        def zeroddt(p, params={}):
+            return 0.0
+
+        def oneddt(t, params={}):
+            return 1.0
+
+        self.dparamsdt['t'] = oneddt
+        for n in self.param_names:
+            if n not in self.dparamsdt:
+                self.dparamsdt[n] = zeroddt
+        return
+
+    def make_function_space(self,
+                            mesh=None,
+                            dim=None,
+                            degree=None
+                            ):
+        if not mesh: mesh = self.mesh
+        if not dim: dim = self.dim
+        if not degree: degree = self.degree
+        SE = FiniteElement('DG', cellShapes[dim-1], degree)
+        SS = FunctionSpace(mesh, SE)   # scalar space
+        elements = [SE] * (self.nligands + 1)
+        VE = MixedElement(elements)
+        VS = FunctionSpace(mesh, VE)   # vector space
+        PE = VectorElement('R', mesh.ufl_cell(), 0, dim=self.nparams)
+        PS = FunctionSpace(mesh, PE)
+        PVSE = VE * PE
+        PVS = FunctionSpace(mesh, PVSE)
+        return dict(SE=SE, SS=SS, VE=VE, VS=VS, PS=PS, PVS=PVS)
+
+    def restart(self):
+        logVARIABLE('restart')
+        self.t = self.t0
+        self.PSf.vector()[self.param_numbers['t']] = self.t0
+        CE = FiniteElement('CG', cellShapes[self.dim-1], self.degree)
+        CS = FunctionSpace(self.mesh, CE)   # scalar space
+        coords = gather_dof_coords(CS)
+        fe.assign(self.solVS.sub(0),
+                  function_interpolate(self.rho0, self.SS,
+                                       coords=coords))
+        for i,U0i in enumerate(self.U0s):
+            fe.assign(self.solVS.sub(i+1),
+                      function_interpolate(U0i, self.SS,
+        coords=coords))
+        self.PSf.vector()[:] = [
+            self.params0[name] for name in self.param_names
+        ]
+        fe.assign(self.solPS, self.PSf)
+        
+    def setup_problem(self, debug=False):
+        #
+        # assemble the matrix, if necessary (once for all time points)
+        #
+        if not hasattr(self, 'A'):
+            self.drho_integral = self.tdrho*self.wrho*self.dx
+            self.dU_integral = sum(
+                [tdUi*wUi*self.dx for tdUi,wUi in zip(self.tdUs, self.wUs)]
+            )
+            self.dP_integral = sum(
+                [tdPi*wPi*self.dx for tdPi,wPi in zip(self.tdPs, self.wPs)]
+            )
+            self.A = fe.assemble(self.drho_integral + self.dU_integral +
+                                 self.dP_integral)
+            self.dsol = Function(self.PVS)
+            dsolVS, dsolPS = self.dsol.split()
+            dsolVSsplit = dsolVS.split()
+            self.drho, self.dUs = dsolVSsplit[0], dsolVSsplit[1:]
+            self.dPs = dsolPS.split()
+        #
+        # assemble RHS (for each time point, but compile only once)
+        #
+        if not hasattr(self, 'P_terms'):
+            self.P_terms = 0.0
+            for i,n in enumerate(self.param_names):
+                dpdt = self.dparamsdt[n](
+                    self.iPs[i], params=self.iparams
+                )
+                if dpdt != 0:             # avoid annoying exception if 0
+                    term = dpdt*self.wPs[i]*self.dx
+                    self.P_terms += term
+        if not hasattr(self, 'rho_terms'):
+            self.sigma = self.iparams['sigma']
+            self.s2 = self.sigma * self.sigma / 2
+            self.rhomin = self.iparams['rhomin']
+            self.rhopen = self.iparams['rhopen']
+            self.grhopen = self.iparams['grhopen']
+            self.v = -ufl.grad(self.V(self.iUs, self.irho)) - (
+                self.s2*ufl.grad(self.irho)/ufl.max_value(self.irho,
+                                                          self.rhomin) 
+            )
+            self.flux = self.v * self.irho
+            self.vn = ufl.max_value(ufl.dot(self.v, self.n), 0)
+            self.facet_flux = ufl.jump(self.vn*ufl.max_value(self.irho, 0.0))
+            self.rho_flux_jump = -self.facet_flux*ufl.jump(self.wrho)*self.dS
+            self.rho_grad_move = ufl.dot(self.flux,
+                                         ufl.grad(self.wrho))*self.dx
+            self.rho_penalty = -(
+                (self.degree**2 / self.havg) *
+                ufl.dot(ufl.jump(self.irho, self.n),
+                        ufl.jump(self.rhopen*self.wrho, self.n)) * self.dS
+            )
+            self.grho_penalty = -(
+                self.degree**2 *
+                (ufl.jump(ufl.grad(self.irho), self.n) *
+                 ufl.jump(ufl.grad(self.grhopen*self.wrho), self.n)) *
+                self.dS
+            )
+            self.rho_terms = (
+                self.rho_flux_jump + self.rho_grad_move +
+                self.rho_penalty + self.grho_penalty
+            )
+        if not hasattr(self, 'U_terms'):
+            self.Umin = self.iparams['Umin']
+            self.Upen = self.iparams['Upen']
+            self.gUpen = self.iparams['gUpen']
+            self.U_decay = sum(
+                [-lig.gamma * iUi * wUi * self.dx for
+                 lig,iUi,wUi in
+                 zip(self.iligands.ligands(), self.iUs, self.wUs)]
+            )
+            self.U_secretion = sum(
+                [lig.s * self.irho * wUi * self.dx for
+                 lig,wUi in zip(self.iligands.ligands(), self.wUs)]
+            )
+            self.jump_gUw = sum(
+                [ufl.jump(lig.D * wUi * ufl.grad(iUi), self.n) * self.dS
+                for lig,wUi,iUi in
+                zip(self.iligands.ligands(), self.wUs, self.iUs)]
+            )
+            self.U_diffusion = sum(
+                [-lig.D * ufl.dot(ufl.grad(iUi), ufl.grad(wUi))*self.dx for
+                 lig,iUi,wUi in
+                 zip(self.iligands.ligands(), self.iUs, self.wUs)]
+            )
+            self.U_penalty = sum(
+                [-(self.degree**2/self.havg) *
+                 ufl.dot(ufl.jump(iUi, self.n),
+                         ufl.jump(self.Upen*wUi, self.n))*self.dS for
+                 iUi,wUi in zip(self.iUs, self.wUs)]
+            )
+            self.gU_penalty = sum(
+                [-self.degree**2 * 
+                 ufl.jump(ufl.grad(iUi), self.n) *
+                 ufl.jump(ufl.grad(self.gUpen*wUi), self.n) * self.dS for
+                 iUi,wUi in zip(self.iUs, self.wUs)]
+            )
+            self.U_terms = (
+                # decay and secretion
+                self.U_decay + self.U_secretion +
+                # diffusion
+                self.jump_gUw + self.U_diffusion +
+                # penalties (to enforce continuity)
+                self.U_penalty + self.gU_penalty
+            )
+        if not hasattr(self, 'all_terms'):
+            self.all_terms = self.rho_terms + self.U_terms + self.P_terms
+        if not hasattr(self, 'J_terms'):
+            self.J_terms = fe.derivative(self.all_terms, self.sol)
+
+    def ddt(self, debug=False):
+        """Calculate time derivative of rho and U
+
+        Results are left in self.dsol as a two-component vector function.
+        """
+        self.setup_problem(debug)
+        self.b = fe.assemble(self.all_terms)
+        return fe.solve(self.A, self.dsol.vector(), self.b,
+                        self.solver_type)
+
